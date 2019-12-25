@@ -3,11 +3,10 @@ extern crate log;
 extern crate mysql;
 
 mod utils;
+mod error;
 
-use utils::Opts;
-use structopt::StructOpt;
+use utils::parse;
 
 fn main() {
-    let opts = Opts::from_args();
-    println!("{:?}", opts)
+    parse();
 }
