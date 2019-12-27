@@ -1,8 +1,8 @@
 use std::ffi::OsStr;
 use std::iter::Skip;
 use std::path::Path;
-use std::thread;
 use std::sync::Arc;
+use std::thread;
 
 use crate::error::{CalaError, Error, MySQLError};
 use calamine::{
@@ -55,7 +55,9 @@ pub struct Table {
 impl Table {
     pub fn new(table_name: &str, range: Range<DataType>) -> Result<Self, CalaError> {
         let mut fields = Vec::new();
-        let mut iter = RangeDeserializerBuilder::new().from_range(&range)?;
+        let mut iter = RangeDeserializerBuilder::new()
+            .has_headers(false)
+            .from_range(&range)?;
 
         if let Some(result) = iter.next() {
             let row: Vec<DataType> = result?;
@@ -66,8 +68,15 @@ impl Table {
             }
         }
 
+        let mut table_name_result = String::new();
+        for i in table_name.chars() {
+            if i.is_ascii() && i != '(' && i != ')' {
+                table_name_result.push(i);
+            }
+        }
+
         Ok(Table {
-            name: String::from(table_name),
+            name: table_name_result,
             fields,
             range,
         })
@@ -80,24 +89,36 @@ impl Table {
         let iter = RangeDeserializerBuilder::new().from_range(&self.range)?;
         Ok(iter.skip(skip))
     }
+
+    pub fn to_django_style_fields(&mut self) {
+        for i in 0..self.fields.len() {
+            if self.fields[i] != "id" {
+                self.fields[i] = format!("c_{}", self.fields[i]);
+            }
+        }
+    }
 }
 
 pub fn parse_excel(filepath: &str) -> Result<Vec<Table>, CalaError> {
-    let mut sheets = Vec::new();
+    let mut tables = Vec::new();
     let mut workbook: Xlsx<_> = open_workbook(&filepath)?;
 
     for sheet_name in workbook.sheet_names().to_owned().iter() {
         if let Some(Ok(range)) = workbook.worksheet_range(sheet_name) {
-            sheets.push(Table::new(sheet_name, range)?);
+            tables.push(Table::new(sheet_name, range)?);
         } else {
             warn!("sheet {} not found", sheet_name);
         }
     }
 
-    Ok(sheets)
+    Ok(tables)
 }
 
-pub fn import_table_to_database(opts: Arc<Opts>, pool: Arc<Pool>, table: Table) -> Result<(u32, String), Error> {
+pub fn import_table_to_database(
+    opts: Arc<Opts>,
+    pool: Arc<Pool>,
+    table: Table,
+) -> Result<(u32, String), Error> {
     let table_name = if opts.django_style {
         make_django_style_table_name(&opts.excel, &table.name)
     } else {
@@ -114,7 +135,8 @@ pub fn import_table_to_database(opts: Arc<Opts>, pool: Arc<Pool>, table: Table) 
     for row in table.iter_rows(opts.skip)? {
         if let Ok(r) = row {
             count += 1;
-            pool.prep_exec(make_insert_sql(&table_name, &table.fields, &r), ())?;
+            let sql = make_insert_sql(&table_name, &table.fields, &r);
+            pool.prep_exec(sql, ())?;
         } else {
             warn!("Invalid row of {}: {:?}", table_name, row);
         }
@@ -143,7 +165,7 @@ pub fn make_insert_sql(table_name: &str, fields: &Vec<String>, row: &Vec<DataTyp
     let row_len = row.len();
     for i in 0..row_len {
         match &row[i] {
-            DataType::String(v) => result.push_str(format!("`{}`", v).as_str()),
+            DataType::String(v) => result.push_str(format!("\"{}\"", v).as_str()),
             DataType::Bool(v) => result.push_str(format!("{}", *v as i32).as_str()),
             DataType::Int(v) => result.push_str(format!("{}", v).as_str()),
             DataType::Float(v) => result.push_str(format!("{}", v).as_str()),
@@ -203,7 +225,11 @@ pub fn parse() {
     let parse_result = parse_excel(&opts.excel);
 
     if let Ok(result) = parse_result {
-        for table in result.into_iter() {
+        for mut table in result.into_iter() {
+            if opts.django_style {
+                table.to_django_style_fields();
+            }
+
             let cloned_opts = opts.clone();
             let cloned_pool = pool.clone();
 
@@ -232,10 +258,11 @@ mod test {
         if let Ok(r) = result {
             assert_eq!(r.len(), 8);
 
-            if let Ok(_rows) = &r[0].iter_rows(1) {
+            if let Ok(_row) = &r[1].iter_rows(1) {
             } else {
                 panic!("Invalid first table")
             }
+            println!("{:?}", &r[1].fields)
         } else {
             panic!("{}", result.unwrap_err())
         }
@@ -266,7 +293,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_check_table_exists_v1() {
         let mut builder = mysql::OptsBuilder::new();
         builder
@@ -296,6 +322,9 @@ mod test {
                 DataType::Int(12),
             ],
         );
-        assert_eq!(sql, "INSERT INTO `UBOX_english_hn_lt` (`id`, `name`, `age`) VALUES (1, `Tom`, 12);")
+        assert_eq!(
+            sql,
+            "INSERT INTO `UBOX_english_hn_lt` (`id`, `name`, `age`) VALUES (1, \"Tom\", 12);"
+        )
     }
 }
